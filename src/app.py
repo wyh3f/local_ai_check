@@ -1,4 +1,4 @@
-"""本地 AI 部署能力检测工具。
+"""本地 AI 部署能力检测工具（customtkinter 浅色专业风界面）。
 
 用法：
     python app.py                启动图形界面
@@ -8,320 +8,328 @@
 
 from __future__ import annotations
 
-import json
 import os
 import platform
-import struct
 import sys
-import tempfile
 import threading
 import time
 import tkinter as tk
-from ctypes import wintypes
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
-from evaluator import Evaluation, evaluate
+import customtkinter as ctk
+
+from appinfo import APP_TITLE, VERSION
+from evaluator import TIERS, Evaluation, evaluate
 from hardware import HardwareInfo, detect_hardware
+from platform_win import asset_path, work_area
+from report import build_report, gpu_line, run_cli
+from selftest import run_selftest
 
-APP_TITLE = "本地 AI 部署能力检测"
-VERSION = "1.1"
-FONT_UI = ("Microsoft YaHei", 10)
-FONT_TITLE = ("Microsoft YaHei", 18, "bold")
-FONT_HEADLINE = ("Microsoft YaHei", 13, "bold")
+# 浅色专业风配色
+BG = "#f4f6f9"
+CARD = "#ffffff"
+BORDER = "#e3e8ef"
+PRIMARY = "#2563eb"
+PRIMARY_HOVER = "#1d4ed8"
+PRIMARY_DISABLED = "#9db9f5"
+TEXT = "#1f2937"
+MUTED = "#6b7280"
+SKELETON = "#cbd5e1"
+SKELETON_HOT = "#94a3b8"
+OK = "#15803d"
+WARN = "#c2410c"
+BAD = "#b91c1c"
 
-
-def _asset(name: str) -> str:
-    """定位随程序分发的资源，兼容源码运行与单文件打包两种模式。"""
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(base, "assets", name)
-
-
-def _work_area() -> tuple[int, int, int, int]:
-    """读取不含任务栏的桌面工作区，返回 (x, y, 宽, 高)，失败时返回全零。"""
-    try:
-        import ctypes
-
-        rect = wintypes.RECT()
-        if ctypes.windll.user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(rect), 0):
-            return rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top
-    except Exception:
-        pass
-    return 0, 0, 0, 0
-
-
-def _enable_dpi_awareness() -> None:
-    """开启 DPI 感知，避免 125%/150% 缩放下整个界面被位图拉伸发虚。"""
-    if sys.platform != "win32":
-        return
-    import ctypes
-
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # Win8.1+
-    except Exception:
-        try:
-            ctypes.windll.user32.SetProcessDPIAware()  # Win7 兜底
-        except Exception:
-            pass
-
-
-def _system_dpi(root: tk.Tk) -> int:
-    """读取真实屏幕 DPI。per-monitor 感知下 Tk 自报 96，需直接问系统。"""
-    if sys.platform == "win32":
-        import ctypes
-
-        try:
-            dpi = int(ctypes.windll.user32.GetDpiForSystem())
-            if 60 <= dpi <= 400:
-                return dpi
-        except Exception:
-            pass
-    try:
-        return int(root.winfo_fpixels("1i"))
-    except Exception:
-        return 96
-
-
-def _gpu_line(gpu) -> str:
-    text = gpu.detail
-    if gpu.driver:
-        text += f"，驱动 {gpu.driver}"
-    return f"{gpu.name}（{text}）"
-
-
-def build_report(hw: HardwareInfo, ev: Evaluation) -> str:
-    """把检测结果拼装成纯文本报告，供复制或命令行输出。"""
-    gpu_lines = (
-        "\n".join(f"                {_gpu_line(g)}" for g in hw.gpus) or "                未检测到显卡"
-    )
-    ram_line = f"{hw.ram_total_gb:g} GB"
-    if hw.ram_speed_mhz or hw.ram_modules:
-        ram_line += f"（{hw.ram_speed_mhz} MHz，{hw.ram_modules} 条）"
-    cpu_line = f"{hw.cpu_cores} 核 {hw.cpu_threads} 线程 @ {hw.cpu_freq_mhz} MHz"
-    if hw.cpu_usage >= 0:
-        cpu_line += f"，当前占用 {hw.cpu_usage}%"
-    disk_line = f"{hw.disk_free_gb:g} GB 可用 / 共 {hw.disk_total_gb:g} GB"
-    if hw.disk_model:
-        disk_line = f"{hw.disk_model}，{disk_line}"
-
-    lines = [
-        "===== 本地 AI 部署能力检测报告 =====",
-        f"程序版本：v{VERSION}",
-        f"检测时间：{datetime.now():%Y-%m-%d %H:%M:%S}",
-        "",
-        "[系统信息]",
-        f"  操作系统 ：{hw.os_name}",
-        f"  系统架构 ：{hw.arch}",
-        f"  计算机名 ：{hw.hostname}",
-        f"  当前用户 ：{hw.username}",
-        f"  内存使用 ：{hw.ram_percent}%（可用 {hw.ram_available_gb:g} GB / 共 {hw.ram_total_gb:g} GB）",
-        "",
-        "[硬件信息]",
-        f"  CPU      ：{hw.cpu_name}",
-        f"               {cpu_line}",
-        f"  内存     ：{ram_line}",
-        f"  显卡     ：{gpu_lines.strip()}",
-        f"  磁盘     ：{disk_line}",
-        "",
-        "[评估结论]",
-        f"  是否适合部署：{'是' if ev.deployable else '否'}",
-        f"  推荐推理路径：{ev.path}",
-        f"  资源池      ：{ev.pool_label} {ev.pool_gb:g} GB（推荐线 {ev.rec_line:g}%，可用线 {ev.ok_line:g}%）",
-        f"  最高承受等级：{ev.tier}{'（' + ev.best.params_desc + ' 参数）' if ev.best else ''}",
-        f"  用途适配    ：" + "  ".join(f"{name} {mark}" for name, mark in ev.usage_tags),
-        f"  综合评分    ：{ev.score}/100",
-        f"  结论        ：{ev.headline}",
-    ]
-    if ev.tier_desc:
-        lines.append(f"  等级说明    ：{ev.tier_desc}")
-
-    lines += [
-        "",
-        "[等级对照（按 4-bit 量化估算）]",
-        "  等级     参数量级    4-bit 占用   结论    判定依据                预估速度                适用场景",
-    ]
-    for t in ev.tiers:
-        if t.speed == "不可用":
-            speed_text = "跑不动"
-        else:
-            speed_text = f"{t.speed} tok/s（{t.speed_level}）"
-        lines.append(
-            f"  {t.label:<7} {t.params_desc:<10} {t.need_gb:>6.1f} GB   {t.verdict:<5} "
-            f"{t.reason:<22} {speed_text:<24} {t.scene}"
-        )
-
-    lines += ["", "[使用 AI 能做到什么程度]"]
-    for idx, tip in enumerate(ev.advice, 1):
-        lines.append(f"  {idx}. {tip}")
-    return "\n".join(lines)
-
-
-def run_cli() -> int:
-    hw = detect_hardware()
-    ev = evaluate(hw)
-    print(build_report(hw, ev))
-    return 0
+STATUS_TEXTS = (
+    "正在读取 CPU 信息…（1/4）",
+    "正在识别显卡与显存…（2/4）",
+    "正在检查内存与磁盘…（3/4）",
+    "正在评估模型等级…（4/4）",
+)
 
 
 class App:
     """图形界面主窗口。"""
 
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: ctk.CTk) -> None:
         self.root = root
         self.report = ""
         self.busy = False
+        self._score_after: str | None = None
+        self._status_after: str | None = None
+        self._status_index = 0
+        self._score_value = 0
+        self._spinner_after: str | None = None
+        self._spinner_index = 0
+        self._skeleton_after: str | None = None
+        self._skeleton_index = 0
+        self._progress_after: str | None = None
+        self._progress_value = 0.0
+        self._progress_target = 0.0
+
         root.title(f"{APP_TITLE} v{VERSION}")
         try:
-            root.iconbitmap(_asset("icon.ico"))
+            root.iconbitmap(asset_path("icon.ico"))
         except Exception:
             pass
-        # 按真实 DPI 缩放，保证 125%/150% 下字号与控件尺寸同步放大
-        dpi = _system_dpi(root)
-        self.scale = max(1.0, dpi / 96.0)
-        try:
-            root.tk.call("tk", "scaling", dpi / 72.0)
-        except Exception:
-            pass
-        wx, wy, ww, wh = _work_area()
+
+        # customtkinter 自己处理 DPI 缩放，geometry 传入的是逻辑像素
+        self.scale = root._get_window_scaling()
+        wx, wy, ww, wh = work_area()
         if not ww or not wh:
             wx, wy, ww, wh = 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
-        width = min(int(980 * self.scale), max(int(760 * self.scale), ww - int(80 * self.scale)))
-        # geometry 不含标题栏，额外预留约 40px，保证整窗落在工作区内
-        height = min(int(860 * self.scale), max(int(520 * self.scale), wh - int(100 * self.scale)))
-        x = wx + max(0, (ww - width) // 2)
-        y = wy + max(0, (wh - height) // 2)
+        logical_w, logical_h = ww / self.scale, wh / self.scale
+        width = int(min(1000, max(780, logical_w - 80)))
+        height = int(min(880, max(560, logical_h - 100)))
+        x = int(wx / self.scale + max(0, (logical_w - width) / 2))
+        y = int(wy / self.scale + max(0, (logical_h - height) / 2))
         root.geometry(f"{width}x{height}+{x}+{y}")
-        root.minsize(int(720 * self.scale), int(480 * self.scale))
+        root.minsize(760, 520)
 
         self._init_style()
         self._build_layout()
         self.refresh()
 
-    # ---------- 界面搭建 ----------
+    # ---------- 样式 ----------
+    def _font(self, size: int, weight: str = "normal") -> ctk.CTkFont:
+        return ctk.CTkFont(family="Microsoft YaHei", size=size, weight=weight)
+
     def _init_style(self) -> None:
+        """ttk 表格不归 customtkinter 管，需要手动贴合主题。"""
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure(".", font=FONT_UI)
-        style.configure("Card.TFrame", background="#ffffff", relief="solid", borderwidth=1)
-        style.configure("Plain.TFrame", background="#ffffff", borderwidth=0)
-        style.configure("Headline.TLabel", font=FONT_HEADLINE, background="#ffffff")
-        style.configure("Muted.TLabel", foreground="#5f6368", background="#ffffff")
-        style.configure("Treeview", rowheight=int(26 * self.scale), font=FONT_UI)
-        style.configure("Treeview.Heading", font=("Microsoft YaHei", 10, "bold"))
-        style.configure("Accent.TButton", font=("Microsoft YaHei", 10, "bold"))
+        # ttk 字号按磅计算，逻辑像素 × 0.75 换算后与 CTk 字号视觉一致
+        point_size = max(8, round(13 * 0.75))
+        style.configure(
+            "Tiers.Treeview",
+            background=CARD,
+            fieldbackground=CARD,
+            foreground=TEXT,
+            borderwidth=0,
+            rowheight=int(28 * self.scale),
+            font=("Microsoft YaHei", point_size),
+        )
+        style.configure(
+            "Tiers.Treeview.Heading",
+            background="#f1f5f9",
+            foreground="#475569",
+            relief="flat",
+            borderwidth=0,
+            font=("Microsoft YaHei", point_size, "bold"),
+        )
+        style.map("Tiers.Treeview.Heading", background=[("active", "#e2e8f0")])
+        style.map(
+            "Tiers.Treeview",
+            background=[("selected", "#dbeafe")],
+            foreground=[("selected", TEXT)],
+        )
+        style.layout("Tiers.Treeview", [("Tiers.Treeview.treearea", {"sticky": "nswe"})])
 
+    # ---------- 界面搭建 ----------
     def _build_layout(self) -> None:
-        # 底部操作栏固定在窗口底部，不随内容滚动
-        bar = ttk.Frame(self.root, padding=(16, 10))
+        self._build_action_bar()
+        body = self._build_scroll_area()
+        self._build_header(body)
+        self._build_summary_card(body)
+        self._build_tier_table(body)
+        self._build_info_row(body)
+        self._build_advice_card(body)
+
+    def _build_action_bar(self) -> None:
+        """底部操作栏固定在窗口底部，不随内容滚动。"""
+        bar = ctk.CTkFrame(self.root, fg_color=CARD, corner_radius=0, height=64, border_width=0)
         bar.pack(side="bottom", fill="x")
-        self.refresh_btn = ttk.Button(bar, text="重新检测", style="Accent.TButton", command=self.refresh)
-        self.refresh_btn.pack(side="left")
-        ttk.Button(bar, text="复制报告", command=self.copy_report).pack(side="left", padx=8)
-        ttk.Button(bar, text="保存报告", command=self.save_report).pack(side="left")
-        ttk.Button(bar, text="关于", command=self.show_about).pack(side="left", padx=8)
-        self.status_var = tk.StringVar(value="")
-        ttk.Label(bar, textvariable=self.status_var, foreground="#5f6368").pack(side="right")
-        self.progress = ttk.Progressbar(bar, mode="indeterminate", length=int(110 * self.scale))
-        self.progress.pack(side="right", padx=(8, 12))
+        bar.pack_propagate(False)
+        self.refresh_btn = ctk.CTkButton(
+            bar,
+            text="重新检测",
+            width=112,
+            height=34,
+            corner_radius=8,
+            fg_color=PRIMARY,
+            hover_color=PRIMARY_HOVER,
+            font=self._font(13, "bold"),
+            command=self.refresh,
+        )
+        self.refresh_btn.pack(side="left", padx=(20, 8), pady=15)
+        self._secondary_button(bar, "复制报告", self.copy_report)
+        self._secondary_button(bar, "保存报告", self.save_report)
+        self._secondary_button(bar, "关于", self.show_about)
 
-        # 用 Canvas 承载内容，窗口较小时可以滚动查看完整信息
-        container = ttk.Frame(self.root)
-        container.pack(fill="both", expand=True)
-        bg = ttk.Style().lookup("TFrame", "background")
-        canvas = tk.Canvas(container, highlightthickness=0, background=bg)
-        scrollbar = ttk.Scrollbar(container, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
+        self.status_var = tk.StringVar(value="准备就绪")
+        ctk.CTkLabel(
+            bar, textvariable=self.status_var, font=self._font(12), text_color=MUTED
+        ).pack(side="right", padx=(8, 20))
+        self.progress = ctk.CTkProgressBar(
+            bar, mode="indeterminate", width=110, height=6, progress_color=PRIMARY, fg_color="#e2e8f0"
+        )
+        self.progress.set(0)
 
-        outer = ttk.Frame(canvas, padding=16)
-        window_id = canvas.create_window((0, 0), window=outer, anchor="nw")
-        outer.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-        self._wrap_labels: list[ttk.Label] = []
+    def _secondary_button(self, parent, text: str, command) -> ctk.CTkButton:
+        button = ctk.CTkButton(
+            parent,
+            text=text,
+            width=96,
+            height=34,
+            corner_radius=8,
+            fg_color="transparent",
+            border_width=1,
+            border_color="#d1d5db",
+            text_color="#374151",
+            hover_color="#f3f4f6",
+            font=self._font(13),
+            command=command,
+        )
+        button.pack(side="left", padx=(0, 8), pady=15)
+        return button
 
-        def on_canvas_resize(event: tk.Event) -> None:
-            canvas.itemconfigure(window_id, width=event.width)
-            # 文本按窗口宽度换行，避免固定 wraplength 在缩放后出现截断
-            wrap = max(int(360 * self.scale), event.width - int(120 * self.scale))
-            for label in self._wrap_labels:
-                label.configure(wraplength=wrap)
+    def _build_scroll_area(self) -> ctk.CTkScrollableFrame:
+        body = ctk.CTkScrollableFrame(
+            self.root,
+            fg_color=BG,
+            corner_radius=0,
+            scrollbar_button_color="#cbd5e1",
+            scrollbar_button_hover_color="#94a3b8",
+        )
+        body.pack(fill="both", expand=True)
+        self._wrap_labels: list[ctk.CTkLabel] = []
+        body.bind("<Configure>", self._on_body_resize)
+        return body
 
-        canvas.bind("<Configure>", on_canvas_resize)
+    def _on_body_resize(self, event: tk.Event) -> None:
+        # CTkLabel 的 wraplength 内部会再乘缩放，这里换算回逻辑像素
+        wrap = max(360, int(event.width / self.scale) - 108)
+        for label in self._wrap_labels:
+            label.configure(wraplength=wrap)
 
-        def on_wheel(event: tk.Event) -> None:
-            if isinstance(event.widget, tk.Text):
-                return
-            canvas.yview_scroll(int(-event.delta / 120), "units")
+    def _card(self, body: ctk.CTkFrame, pady: tuple[int, int] = (0, 14)) -> ctk.CTkFrame:
+        card = ctk.CTkFrame(body, fg_color=CARD, corner_radius=14, border_width=1, border_color=BORDER)
+        card.pack(fill="x", padx=22, pady=pady)
+        return card
 
-        canvas.bind_all("<MouseWheel>", on_wheel)
-
-        ttk.Label(outer, text=APP_TITLE, font=FONT_TITLE).pack(anchor="w")
-        ttk.Label(
-            outer,
+    def _build_header(self, body: ctk.CTkFrame) -> None:
+        ctk.CTkLabel(
+            body, text=APP_TITLE, font=self._font(26, "bold"), text_color=TEXT, anchor="w"
+        ).pack(fill="x", padx=22, pady=(20, 2))
+        ctk.CTkLabel(
+            body,
             text="检测本机 CPU、内存、显卡与磁盘，评估能否在本地运行开源大模型",
-            foreground="#5f6368",
-        ).pack(anchor="w", pady=(2, 12))
+            font=self._font(12),
+            text_color=MUTED,
+            anchor="w",
+        ).pack(fill="x", padx=22, pady=(0, 14))
 
-        # 结论卡片
-        card = ttk.Frame(outer, style="Card.TFrame", padding=14)
-        card.pack(fill="x")
-        self.headline_var = tk.StringVar(value="正在检测…")
-        self.headline_label = ttk.Label(card, textvariable=self.headline_var, style="Headline.TLabel")
-        self.headline_label.pack(anchor="w")
+    def _build_summary_card(self, body: ctk.CTkFrame) -> None:
+        """结论卡片：结论、等级、推理路径、资源池、评分与用途标签。"""
+        card = self._card(body, pady=(0, 14))
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=20, pady=18)
 
-        meta = ttk.Frame(card, style="Plain.TFrame")
-        meta.pack(fill="x", pady=(8, 0))
-        self.tier_var = tk.StringVar(value="等级：—")
-        self.path_var = tk.StringVar(value="推理路径：—")
-        self.budget_var = tk.StringVar(value="预算：—")
-        self.score_var = tk.StringVar(value="评分：—")
-        for var in (self.tier_var, self.path_var, self.budget_var, self.score_var):
-            ttk.Label(meta, textvariable=var, style="Muted.TLabel").pack(side="left", padx=(0, 22))
+        self.headline_label = ctk.CTkLabel(
+            inner, text="正在检测…", font=self._font(20, "bold"), text_color=MUTED, anchor="w", justify="left"
+        )
+        self.headline_label.pack(fill="x")
+        self._wrap_labels.append(self.headline_label)
 
-        self.tags_var = tk.StringVar(value="")
-        ttk.Label(card, textvariable=self.tags_var, style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
+        meta = ctk.CTkFrame(inner, fg_color="transparent")
+        meta.pack(fill="x", pady=(10, 0))
+        self.tier_label = self._meta_label(meta, "等级：—")
+        self.path_label = self._meta_label(meta, "推理路径：—")
+        self.budget_label = self._meta_label(meta, "资源池：—")
+        self.score_label = self._meta_label(meta, "综合评分：—")
 
-        # 系统信息
-        sys_box = ttk.LabelFrame(outer, text=" 系统信息 ", padding=10)
-        sys_box.pack(fill="x", pady=(14, 0))
-        self.sys_vars: dict[str, tk.StringVar] = {}
-        for row, (key, label) in enumerate(
+        row = ctk.CTkFrame(inner, fg_color="transparent")
+        row.pack(fill="x", pady=(12, 0))
+        self.tag_chips: list[tuple[ctk.CTkFrame, ctk.CTkLabel]] = []
+        for _ in range(4):
+            chip = ctk.CTkFrame(row, fg_color="#eef2f7", corner_radius=9)
+            chip.pack(side="left", padx=(0, 8))
+            label = ctk.CTkLabel(chip, text="检测中", font=self._font(12), text_color=SKELETON_HOT)
+            label.pack(padx=10, pady=3)
+            self.tag_chips.append((chip, label))
+
+    def _meta_label(self, parent: ctk.CTkFrame, text: str) -> ctk.CTkLabel:
+        label = ctk.CTkLabel(parent, text=text, font=self._font(12), text_color=MUTED, anchor="w")
+        label.pack(side="left", padx=(0, 26))
+        return label
+
+    def _build_info_row(self, body: ctk.CTkFrame) -> None:
+        """系统信息与硬件信息左右并排，给等级对照表留出首屏空间。"""
+        row = ctk.CTkFrame(body, fg_color="transparent")
+        row.pack(fill="x", padx=22, pady=(0, 12))
+        row.grid_columnconfigure((0, 1), weight=1, uniform="info")
+
+        system = ctk.CTkFrame(row, fg_color=CARD, corner_radius=14, border_width=1, border_color=BORDER)
+        system.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        hardware = ctk.CTkFrame(row, fg_color=CARD, corner_radius=14, border_width=1, border_color=BORDER)
+        hardware.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+
+        self.sys_labels = self._fill_info_card(
+            system,
+            "系统信息",
             [
                 ("os", "操作系统"),
                 ("arch", "系统架构"),
                 ("host", "计算机名"),
                 ("user", "当前用户"),
                 ("mem", "内存使用"),
-            ]
-        ):
-            ttk.Label(sys_box, text=label, width=9).grid(row=row, column=0, sticky="w", pady=2)
-            var = tk.StringVar(value="—")
-            self.sys_vars[key] = var
-            value_label = ttk.Label(sys_box, textvariable=var, wraplength=760, justify="left")
-            value_label.grid(row=row, column=1, sticky="w", pady=2)
-            self._wrap_labels.append(value_label)
-        sys_box.columnconfigure(1, weight=1)
+            ],
+        )
+        self.hw_labels = self._fill_info_card(
+            hardware,
+            "硬件信息",
+            [("cpu", "CPU"), ("gpu", "显卡"), ("ram", "内存"), ("disk", "磁盘")],
+        )
 
-        # 硬件信息
-        hw_box = ttk.LabelFrame(outer, text=" 硬件信息 ", padding=10)
-        hw_box.pack(fill="x", pady=(10, 0))
-        self.hw_vars: dict[str, tk.StringVar] = {}
-        for row, (key, label) in enumerate(
-            [("cpu", "CPU"), ("gpu", "显卡"), ("ram", "内存"), ("disk", "磁盘")]
-        ):
-            ttk.Label(hw_box, text=label, width=8).grid(row=row, column=0, sticky="nw", pady=2)
-            var = tk.StringVar(value="—")
-            self.hw_vars[key] = var
-            value_label = ttk.Label(hw_box, textvariable=var, wraplength=760, justify="left")
-            value_label.grid(row=row, column=1, sticky="w", pady=2)
-            self._wrap_labels.append(value_label)
-        hw_box.columnconfigure(1, weight=1)
+    def _fill_info_card(
+        self, card: ctk.CTkFrame, title: str, rows: list[tuple[str, str]]
+    ) -> dict[str, ctk.CTkLabel]:
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="both", expand=True, padx=18, pady=(14, 14))
+        ctk.CTkLabel(
+            inner, text=title, font=self._font(14, "bold"), text_color="#334155", anchor="w"
+        ).pack(fill="x", pady=(0, 8))
 
-        # 等级对照表
-        model_box = ttk.LabelFrame(outer, text=" 等级对照（按 4-bit 量化估算） ", padding=8)
-        model_box.pack(fill="x", pady=(14, 0))
+        values: dict[str, ctk.CTkLabel] = {}
+        for key, label in rows:
+            row = ctk.CTkFrame(inner, fg_color="transparent")
+            row.pack(fill="x", pady=2)
+            ctk.CTkLabel(
+                row, text=label, width=76, font=self._font(12), text_color=MUTED, anchor="w"
+            ).pack(side="left", anchor="n")
+            value = ctk.CTkLabel(
+                row, text="—", font=self._font(12), text_color=TEXT, anchor="w", justify="left"
+            )
+            value.pack(side="left", fill="x", expand=True)
+            values[key] = value
+
+        # 半宽卡片需要按自身宽度换行，不能沿用整窗 wraplength
+        def resize(event: tk.Event) -> None:
+            wrap = max(160, int(event.width / self.scale) - 64)
+            for label in values.values():
+                label.configure(wraplength=wrap)
+
+        card.bind("<Configure>", resize)
+        return values
+
+    def _build_tier_table(self, body: ctk.CTkFrame) -> None:
+        """等级对照表，列宽按窗口宽度比例自适应。"""
+        card = self._card(body)
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=20, pady=(14, 16))
+        ctk.CTkLabel(
+            inner,
+            text="等级对照（按 4-bit 量化估算）",
+            font=self._font(14, "bold"),
+            text_color="#334155",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 8))
+
         columns = ("tier", "params", "need", "verdict", "reason", "speed", "scene")
-        self.tree = ttk.Treeview(model_box, columns=columns, show="headings", height=6)
+        self.tree = ttk.Treeview(
+            inner, columns=columns, show="headings", height=6, style="Tiers.Treeview"
+        )
         headings = {
             "tier": ("等级", 78),
             "params": ("参数量级", 85),
@@ -333,29 +341,52 @@ class App:
         }
         for key, (text, width) in headings.items():
             self.tree.heading(key, text=text)
-            self.tree.column(key, width=width, anchor="w" if key == "scene" else "center")
-        self.tree.tag_configure("ok", foreground="#1b5e20")
-        self.tree.tag_configure("usable", foreground="#f9a825")
-        self.tree.tag_configure("tight", foreground="#e65100")
-        self.tree.tag_configure("no", foreground="#9e9e9e")
+            self.tree.column(key, width=int(width * self.scale), anchor="w" if key == "scene" else "center")
+
+        # 背景斑马纹 + 前景按结论着色，组合成 8 个 tag
+        for name, color in (("ok", OK), ("usable", "#b45309"), ("tight", WARN), ("no", "#9ca3af")):
+            for parity, background in (("odd", "#f8fafc"), ("even", CARD)):
+                self.tree.tag_configure(f"{name}_{parity}", foreground=color, background=background)
+        # 加载态骨架：灰字占位 + 逐行高亮的扫描波
+        self.tree.tag_configure("skel", foreground=SKELETON, background="#f8fafc")
+        self.tree.tag_configure("skel_even", foreground=SKELETON, background=CARD)
+        self.tree.tag_configure("skel_hot", foreground=SKELETON_HOT, background="#e8f0fe")
         self.tree.pack(fill="x")
-        # 列宽按比例随窗口宽度调整，避免窄窗口下文字被截断
+        self._fill_skeleton()
+
         self._col_weights = {
-            "tier": 0.09,
-            "params": 0.10,
-            "need": 0.10,
+            "tier": 0.08,
+            "params": 0.09,
+            "need": 0.09,
             "verdict": 0.07,
-            "reason": 0.21,
+            "reason": 0.18,
             "speed": 0.16,
-            "scene": 0.27,
+            "scene": 0.33,
         }
         self._tree_width = 0
         self.tree.bind("<Configure>", self._fit_tree_columns)
 
-        # 能力说明
-        advice_box = ttk.LabelFrame(outer, text=" 这台电脑用 AI 能做什么 ", padding=8)
-        advice_box.pack(fill="x", pady=(14, 0))
-        self.advice_text = tk.Text(advice_box, height=9, wrap="word", font=FONT_UI, relief="flat")
+    def _build_advice_card(self, body: ctk.CTkFrame) -> None:
+        card = self._card(body, pady=(0, 18))
+        inner = ctk.CTkFrame(card, fg_color="transparent")
+        inner.pack(fill="x", padx=20, pady=(14, 16))
+        ctk.CTkLabel(
+            inner,
+            text="这台电脑用 AI 能做什么",
+            font=self._font(14, "bold"),
+            text_color="#334155",
+            anchor="w",
+        ).pack(fill="x", pady=(0, 8))
+        self.advice_text = ctk.CTkTextbox(
+            inner,
+            height=170,
+            fg_color="transparent",
+            border_width=0,
+            corner_radius=0,
+            font=self._font(12),
+            text_color=TEXT,
+            wrap="word",
+        )
         self.advice_text.pack(fill="x")
         self.advice_text.configure(state="disabled")
 
@@ -373,10 +404,20 @@ class App:
         if self.busy:
             return
         self.busy = True
-        self.refresh_btn.configure(state="disabled")
-        self.progress.start(14)
-        self.status_var.set("正在检测硬件…")
-        self.headline_var.set("正在检测…")
+        self.refresh_btn.configure(
+            state="disabled", fg_color=PRIMARY_DISABLED, hover_color=PRIMARY_DISABLED
+        )
+        self.progress.pack(side="right", padx=(8, 6))
+        self.progress.configure(mode="determinate")
+        self.progress.set(0)
+        self._progress_value = 0.0
+        self._progress_target = 0.12
+        self.score_label.configure(text="综合评分：—")
+        self._fill_skeleton()
+        self._start_spinner()
+        self._start_skeleton_wave()
+        self._start_status_rotation()
+        self._start_progress()
         threading.Thread(target=self._detect_worker, daemon=True).start()
 
     def _detect_worker(self) -> None:
@@ -396,59 +437,84 @@ class App:
         error: Exception | None,
     ) -> None:
         self.busy = False
-        self.refresh_btn.configure(state="normal")
-        self.progress.stop()
+        self._stop_loading()
+        self.refresh_btn.configure(state="normal", fg_color=PRIMARY, hover_color=PRIMARY_HOVER)
         if error or hw is None or ev is None:
-            self.headline_var.set("检测失败")
+            self.headline_label.configure(text="检测失败", text_color=BAD)
             self.status_var.set(f"错误：{error}")
+            for chip, label in self.tag_chips:
+                chip.configure(fg_color="#f3f4f6")
+                label.configure(text="—", text_color=MUTED)
             return
 
         self.report = build_report(hw, ev)
-        self.headline_var.set(ev.headline)
+        self._render_summary(ev)
+        self._render_system(hw)
+        self._render_hardware(hw)
+        self._render_tiers(ev)
+        self._render_advice(ev)
+        self._animate_score(ev.score)
+        self.status_var.set(f"检测完成，耗时 {elapsed:.1f} 秒")
+
+    def _render_summary(self, ev: Evaluation) -> None:
         if not ev.deployable:
-            color = "#c62828"
+            color = BAD
         elif any(t.verdict == "推荐" for t in ev.tiers):
-            color = "#1b5e20" if ev.score >= 45 else "#e65100"
+            color = OK
         else:
-            color = "#e65100"
-        self.headline_label.configure(foreground=color)
+            # 能跑但都只是「勉强」级别，用橙色提醒
+            color = WARN
+        self.headline_label.configure(text=ev.headline, text_color=color)
 
-        self.tier_var.set(f"等级：{ev.tier}")
-        self.path_var.set(f"推理路径：{ev.path}")
-        self.budget_var.set(
-            f"资源池：{ev.pool_label} {ev.pool_gb:g} GB（推荐线 {ev.rec_line:g}%）"
+        self.tier_label.configure(text=f"等级：{ev.tier}")
+        self.path_label.configure(text=f"推理路径：{ev.path}")
+        self.budget_label.configure(
+            text=f"资源池：{ev.pool_label} {ev.pool_gb:g} GB（推荐线 {ev.rec_line:g}%）"
         )
-        self.score_var.set(f"综合评分：{ev.score}/100")
-        self.tags_var.set("用途：" + "   ".join(f"{name} {mark}" for name, mark in ev.usage_tags))
+        self.score_label.configure(text="综合评分：0/100")
 
-        self.sys_vars["os"].set(hw.os_name)
-        self.sys_vars["arch"].set(hw.arch)
-        self.sys_vars["host"].set(hw.hostname)
-        self.sys_vars["user"].set(hw.username)
-        self.sys_vars["mem"].set(
-            f"{hw.ram_percent}%（可用 {hw.ram_available_gb:g} GB / 共 {hw.ram_total_gb:g} GB）"
+        styles = {
+            "✔": ("#e7f6ec", OK),
+            "△": ("#fdf3e3", "#b45309"),
+            "✘": ("#f3f4f6", "#9ca3af"),
+        }
+        for (chip, label), (name, mark) in zip(self.tag_chips, ev.usage_tags):
+            background, foreground = styles.get(mark, ("#f3f4f6", MUTED))
+            chip.configure(fg_color=background)
+            label.configure(text=f"{name} {mark}", text_color=foreground)
+
+    def _render_system(self, hw: HardwareInfo) -> None:
+        self.sys_labels["os"].configure(text=hw.os_name)
+        self.sys_labels["arch"].configure(text=hw.arch)
+        self.sys_labels["host"].configure(text=hw.hostname)
+        self.sys_labels["user"].configure(text=hw.username)
+        self.sys_labels["mem"].configure(
+            text=f"{hw.ram_percent}%（可用 {hw.ram_available_gb:g} GB / 共 {hw.ram_total_gb:g} GB）"
         )
 
-        cpu_text = (
-            f"{hw.cpu_name}\n{hw.cpu_cores} 核 {hw.cpu_threads} 线程 @ {hw.cpu_freq_mhz} MHz"
-        )
+    def _render_hardware(self, hw: HardwareInfo) -> None:
+        cpu_text = f"{hw.cpu_name}\n{hw.cpu_cores} 核 {hw.cpu_threads} 线程 @ {hw.cpu_freq_mhz} MHz"
         if hw.cpu_usage >= 0:
             cpu_text += f"，当前占用 {hw.cpu_usage}%"
-        self.hw_vars["cpu"].set(cpu_text)
-        gpu_text = "\n".join(_gpu_line(g) for g in hw.gpus) or "未检测到显卡"
-        self.hw_vars["gpu"].set(gpu_text)
+        self.hw_labels["cpu"].configure(text=cpu_text)
+
+        self.hw_labels["gpu"].configure(text="\n".join(gpu_line(g) for g in hw.gpus) or "未检测到显卡")
+
         ram_text = f"{hw.ram_total_gb:g} GB（可用 {hw.ram_available_gb:g} GB"
         if hw.ram_speed_mhz:
             ram_text += f"，{hw.ram_speed_mhz} MHz"
-        self.hw_vars["ram"].set(ram_text + "）")
+        self.hw_labels["ram"].configure(text=ram_text + "）")
+
         disk_text = f"{hw.disk_free_gb:g} GB 可用 / 共 {hw.disk_total_gb:g} GB"
         if hw.disk_model:
             disk_text = f"{hw.disk_model}，{disk_text}"
-        self.hw_vars["disk"].set(disk_text)
+        self.hw_labels["disk"].configure(text=disk_text)
 
+    def _render_tiers(self, ev: Evaluation) -> None:
         self.tree.delete(*self.tree.get_children())
-        for t in ev.tiers:
-            tag = {"推荐": "ok", "可用": "usable", "勉强": "tight"}.get(t.verdict, "no")
+        for index, t in enumerate(ev.tiers):
+            name = {"推荐": "ok", "可用": "usable", "勉强": "tight"}.get(t.verdict, "no")
+            parity = "even" if index % 2 == 0 else "odd"
             speed_text = "跑不动" if t.speed == "不可用" else f"{t.speed} tok/s（{t.speed_level}）"
             self.tree.insert(
                 "",
@@ -462,17 +528,125 @@ class App:
                     speed_text,
                     t.scene,
                 ),
-                tags=(tag,),
+                tags=(f"{name}_{parity}",),
             )
 
+    def _render_advice(self, ev: Evaluation) -> None:
         self.advice_text.configure(state="normal")
         self.advice_text.delete("1.0", "end")
         for idx, tip in enumerate(ev.advice, 1):
             self.advice_text.insert("end", f"{idx}. {tip}\n")
         self.advice_text.configure(state="disabled")
 
-        self.status_var.set(f"检测完成，耗时 {elapsed:.1f} 秒")
+    # ---------- 加载态 ----------
+    def _fill_skeleton(self) -> None:
+        """预填 6 行骨架，避免检测期间表格大片空白。"""
+        self.tree.delete(*self.tree.get_children())
+        for index, tier in enumerate(TIERS):
+            tag = "skel_even" if index % 2 == 0 else "skel"
+            self.tree.insert(
+                "",
+                "end",
+                values=(tier[0], tier[1], "· · ·", "· · ·", "· · ·", "· · ·", "· · ·"),
+                tags=(tag,),
+            )
 
+    def _start_spinner(self) -> None:
+        """检测中的活性指示：圆点颜色在蓝与浅蓝间脉冲。"""
+        self._spinner_index = 0
+
+        def tick() -> None:
+            if not self.busy:
+                return
+            color = PRIMARY if self._spinner_index % 2 == 0 else "#93b4f8"
+            self.headline_label.configure(text="●  正在检测硬件…", text_color=color)
+            self._spinner_index += 1
+            self._spinner_after = self.root.after(450, tick)
+
+        tick()
+
+    def _start_skeleton_wave(self) -> None:
+        """骨架行自上而下循环高亮，形成扫描波。"""
+        self._skeleton_index = 0
+
+        def tick() -> None:
+            if not self.busy:
+                return
+            rows = self.tree.get_children()
+            for index, row in enumerate(rows):
+                tag = "skel_hot" if index == self._skeleton_index else (
+                    "skel_even" if index % 2 == 0 else "skel"
+                )
+                self.tree.item(row, tags=(tag,))
+            self._skeleton_index = (self._skeleton_index + 1) % max(1, len(rows))
+            self._skeleton_after = self.root.after(120, tick)
+
+        self._skeleton_after = self.root.after(0, tick)
+
+    def _start_progress(self) -> None:
+        """确定式进度条，向目标值缓动，避免跳变。"""
+
+        def tick() -> None:
+            if not self.busy:
+                return
+            self._progress_value += (self._progress_target - self._progress_value) * 0.2
+            self.progress.set(min(1.0, self._progress_value))
+            self._progress_after = self.root.after(40, tick)
+
+        tick()
+
+    def _stop_loading(self) -> None:
+        for attr in ("_spinner_after", "_skeleton_after", "_progress_after", "_status_after"):
+            handle = getattr(self, attr)
+            if handle:
+                try:
+                    self.root.after_cancel(handle)
+                except Exception:
+                    pass
+                setattr(self, attr, None)
+        self.progress.stop()
+        self.progress.set(0)
+        self.progress.pack_forget()
+
+    # ---------- 轻量动效 ----------
+    def _start_status_rotation(self) -> None:
+        """检测期间轮播具体步骤，同时推进进度条目标值。"""
+        self._status_index = 0
+        self.status_var.set(STATUS_TEXTS[0])
+
+        def tick() -> None:
+            if not self.busy:
+                return
+            self._status_index = (self._status_index + 1) % len(STATUS_TEXTS)
+            self.status_var.set(STATUS_TEXTS[self._status_index])
+            # 最后一步留一点余量，真正完成时再跳到 100%
+            self._progress_target = min(0.94, 0.12 + 0.22 * (self._status_index + 1))
+            self._status_after = self.root.after(620, tick)
+
+        self._status_after = self.root.after(620, tick)
+
+    def _animate_score(self, target: int) -> None:
+        """评分从 0 滚动到目标值，让结果出现得更有过程感。"""
+        if self._score_after:
+            try:
+                self.root.after_cancel(self._score_after)
+            except Exception:
+                pass
+            self._score_after = None
+        self._score_value = 0
+        step = max(1, target // 18)
+
+        def tick() -> None:
+            self._score_value = min(target, self._score_value + step)
+            self.score_label.configure(text=f"综合评分：{self._score_value}/100")
+            if self._score_value < target:
+                self._score_after = self.root.after(20, tick)
+            else:
+                self._score_after = None
+
+        tick()
+
+    # ---------- 操作 ----------
     def copy_report(self) -> None:
         if not self.report:
             return
@@ -508,115 +682,10 @@ class App:
             "检测本机 CPU、内存、显卡与磁盘，评估可在本地运行的 AI 模型等级。\n"
             "全部检测在本机完成，不联网、不上传任何数据。\n\n"
             f"运行环境：Python {platform.python_version()} / "
-            f"Tk {self.root.tk.call('info', 'patchlevel')}",
+            f"Tk {self.root.tk.call('info', 'patchlevel')} / "
+            f"customtkinter {ctk.__version__}",
             parent=self.root,
         )
-
-
-def run_selftest(output: str = "") -> int:
-    """可移植性自检：逐项验证运行环境，结果写入 JSON 文件。
-
-    返回 0 表示全部关键项通过，1 表示有失败项，2 表示结果文件写不出去。
-    """
-    _enable_dpi_awareness()
-    checks: list[dict[str, object]] = []
-
-    def check(name: str, func, optional: bool = False) -> None:
-        try:
-            ok, detail = func()
-        except Exception as exc:  # 自检要记录失败，而不是直接崩溃
-            ok, detail = False, f"{type(exc).__name__}: {exc}"
-        checks.append({"name": name, "ok": bool(ok), "detail": str(detail), "optional": optional})
-
-    def frozen_probe() -> tuple[bool, str]:
-        base = getattr(sys, "_MEIPASS", "")
-        return bool(getattr(sys, "frozen", False)), f"_MEIPASS={base or '无（源码运行）'}"
-
-    def temp_probe() -> tuple[bool, str]:
-        with tempfile.NamedTemporaryFile(prefix="cs_ai_check_", delete=True) as fh:
-            fh.write(b"ok")
-        return True, tempfile.gettempdir()
-
-    def tk_probe() -> tuple[bool, str]:
-        root = tk.Tk()
-        root.withdraw()
-        patch = root.tk.call("info", "patchlevel")
-        root.update_idletasks()
-        root.destroy()
-        return True, f"Tcl/Tk {patch}"
-
-    def hw_probe() -> tuple[bool, str]:
-        hw = detect_hardware()
-        ok = bool(hw.cpu_name) and hw.ram_total_gb > 0
-        gpus = "、".join(
-            f"{g.name}（{g.vram_gb:g} GB）" if g.vram_gb else f"{g.name}（核显）" for g in hw.gpus
-        ) or "未检测到"
-        return ok, f"CPU={hw.cpu_name}; 内存={hw.ram_total_gb:g} GB; 显卡={gpus}"
-
-    def eval_probe() -> tuple[bool, str]:
-        ev = evaluate(detect_hardware())
-        return bool(ev.tiers), f"等级={ev.tier}; 评分={ev.score}; 等级行数={len(ev.tiers)}"
-
-    def report_probe() -> tuple[bool, str]:
-        hw = detect_hardware()
-        text = build_report(hw, evaluate(hw))
-        return len(text) > 500, f"报告 {len(text)} 字符"
-
-    def font_probe() -> tuple[bool, str]:
-        import tkinter.font as tkfont
-
-        root = tk.Tk()
-        root.withdraw()
-        families = set(tkfont.families(root))
-        root.destroy()
-        # 中文系统里 Tk 返回的是本地化名称，需同时匹配英文名和「微软雅黑」
-        candidates = {"Microsoft YaHei", "Microsoft YaHei UI", "微软雅黑"}
-        available = bool(candidates & families)
-        return available, "微软雅黑可用" if available else "微软雅黑缺失，中文会回退到默认字体"
-
-    def icon_probe() -> tuple[bool, str]:
-        path = _asset("icon.ico")
-        return os.path.isfile(path), f"{path}（{os.path.getsize(path) // 1024} KB）"
-
-    def dpi_probe() -> tuple[bool, str]:
-        if sys.platform != "win32":
-            return True, "非 Windows，跳过"
-        import ctypes
-
-        dpi = int(ctypes.windll.user32.GetDpiForSystem())
-        return True, f"{dpi} dpi（{'已感知' if dpi >= 108 else '未感知，界面会被拉伸'}）"
-
-    check("单文件运行环境", frozen_probe)
-    check("临时目录可写", temp_probe)
-    check("Tk 图形栈", tk_probe)
-    check("硬件采集", hw_probe)
-    check("等级评估", eval_probe)
-    check("报告生成", report_probe)
-    check("图标资源", icon_probe)
-    check("DPI 感知", dpi_probe)
-    check("中文字体", font_probe, optional=True)
-
-    passed = all(c["ok"] for c in checks if not c["optional"])
-    result = {
-        "app": APP_TITLE,
-        "version": VERSION,
-        "time": datetime.now().isoformat(timespec="seconds"),
-        "passed": passed,
-        "python": platform.python_version(),
-        "bits": struct.calcsize("P") * 8,
-        "os": platform.platform(),
-        "checks": checks,
-    }
-    target = output or os.path.join(tempfile.gettempdir(), "cs_ai_check_selftest.json")
-    try:
-        folder = os.path.dirname(os.path.abspath(target))
-        if folder:
-            os.makedirs(folder, exist_ok=True)
-        with open(target, "w", encoding="utf-8") as fh:
-            json.dump(result, fh, ensure_ascii=False, indent=2)
-    except Exception:
-        return 2
-    return 0 if passed else 1
 
 
 def main() -> int:
@@ -629,8 +698,9 @@ def main() -> int:
         return run_selftest(target)
     if "--cli" in args:
         return run_cli()
-    _enable_dpi_awareness()
-    root = tk.Tk()
+    ctk.set_appearance_mode("light")
+    ctk.set_default_color_theme("blue")
+    root = ctk.CTk()
     App(root)
     root.mainloop()
     return 0

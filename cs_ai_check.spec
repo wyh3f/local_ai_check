@@ -1,12 +1,16 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_all
+
+# customtkinter 自带主题 JSON 与字体资源，必须显式收集
+ctk_datas, ctk_binaries, ctk_hidden = collect_all('customtkinter')
 
 a = Analysis(
     ['src/app.py'],
     pathex=[],
-    binaries=[],
-    datas=[('src/assets/icon.ico', 'assets')],
-    hiddenimports=[],
+    binaries=ctk_binaries,
+    datas=[('src/assets/icon.ico', 'assets')] + ctk_datas,
+    hiddenimports=ctk_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

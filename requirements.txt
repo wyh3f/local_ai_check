@@ -1,6 +1,8 @@
-# 运行时依赖：无（仅使用 Python 标准库 tkinter / ctypes / subprocess）
+# 运行时依赖：customtkinter（界面库，依赖 darkdetect）
+# 其余仅使用 Python 标准库 tkinter / ctypes / subprocess
 # 打包依赖：PyInstaller
 # 图标生成：Pillow（仅制作 icon.ico 时使用，不参与打包产物）
 # 环境：conda env exe_ai_check (Python 3.11)
+customtkinter>=6.0
 pyinstaller>=6.10
 pillow>=10.0
