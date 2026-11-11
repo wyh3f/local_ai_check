@@ -19,16 +19,22 @@ import time
 import tkinter as tk
 from ctypes import wintypes
 from datetime import datetime
-from tkinter import ttk
+from tkinter import filedialog, messagebox, ttk
 
 from evaluator import Evaluation, evaluate
 from hardware import HardwareInfo, detect_hardware
 
 APP_TITLE = "本地 AI 部署能力检测"
-VERSION = "1.0"
+VERSION = "1.1"
 FONT_UI = ("Microsoft YaHei", 10)
 FONT_TITLE = ("Microsoft YaHei", 18, "bold")
 FONT_HEADLINE = ("Microsoft YaHei", 13, "bold")
+
+
+def _asset(name: str) -> str:
+    """定位随程序分发的资源，兼容源码运行与单文件打包两种模式。"""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, "assets", name)
 
 
 def _work_area() -> tuple[int, int, int, int]:
@@ -44,15 +50,59 @@ def _work_area() -> tuple[int, int, int, int]:
     return 0, 0, 0, 0
 
 
+def _enable_dpi_awareness() -> None:
+    """开启 DPI 感知，避免 125%/150% 缩放下整个界面被位图拉伸发虚。"""
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)  # Win8.1+
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()  # Win7 兜底
+        except Exception:
+            pass
+
+
+def _system_dpi(root: tk.Tk) -> int:
+    """读取真实屏幕 DPI。per-monitor 感知下 Tk 自报 96，需直接问系统。"""
+    if sys.platform == "win32":
+        import ctypes
+
+        try:
+            dpi = int(ctypes.windll.user32.GetDpiForSystem())
+            if 60 <= dpi <= 400:
+                return dpi
+        except Exception:
+            pass
+    try:
+        return int(root.winfo_fpixels("1i"))
+    except Exception:
+        return 96
+
+
+def _gpu_line(gpu) -> str:
+    text = gpu.detail
+    if gpu.driver:
+        text += f"，驱动 {gpu.driver}"
+    return f"{gpu.name}（{text}）"
+
+
 def build_report(hw: HardwareInfo, ev: Evaluation) -> str:
     """把检测结果拼装成纯文本报告，供复制或命令行输出。"""
     gpu_lines = (
-        "\n".join(f"                {g.name}（{g.detail}）" for g in hw.gpus)
-        or "                未检测到显卡"
+        "\n".join(f"                {_gpu_line(g)}" for g in hw.gpus) or "                未检测到显卡"
     )
     ram_line = f"{hw.ram_total_gb:g} GB"
     if hw.ram_speed_mhz or hw.ram_modules:
         ram_line += f"（{hw.ram_speed_mhz} MHz，{hw.ram_modules} 条）"
+    cpu_line = f"{hw.cpu_cores} 核 {hw.cpu_threads} 线程 @ {hw.cpu_freq_mhz} MHz"
+    if hw.cpu_usage >= 0:
+        cpu_line += f"，当前占用 {hw.cpu_usage}%"
+    disk_line = f"{hw.disk_free_gb:g} GB 可用 / 共 {hw.disk_total_gb:g} GB"
+    if hw.disk_model:
+        disk_line = f"{hw.disk_model}，{disk_line}"
 
     lines = [
         "===== 本地 AI 部署能力检测报告 =====",
@@ -68,10 +118,10 @@ def build_report(hw: HardwareInfo, ev: Evaluation) -> str:
         "",
         "[硬件信息]",
         f"  CPU      ：{hw.cpu_name}",
-        f"               {hw.cpu_cores} 核 {hw.cpu_threads} 线程 @ {hw.cpu_freq_mhz} MHz",
+        f"               {cpu_line}",
         f"  内存     ：{ram_line}",
         f"  显卡     ：{gpu_lines.strip()}",
-        f"  磁盘     ：{hw.disk_free_gb:g} GB 可用 / 共 {hw.disk_total_gb:g} GB",
+        f"  磁盘     ：{disk_line}",
         "",
         "[评估结论]",
         f"  是否适合部署：{'是' if ev.deployable else '否'}",
@@ -121,17 +171,27 @@ class App:
         self.report = ""
         self.busy = False
         root.title(f"{APP_TITLE} v{VERSION}")
-        # 按系统工作区自适应，避免任务栏遮挡或小屏笔记本内容被裁掉
+        try:
+            root.iconbitmap(_asset("icon.ico"))
+        except Exception:
+            pass
+        # 按真实 DPI 缩放，保证 125%/150% 下字号与控件尺寸同步放大
+        dpi = _system_dpi(root)
+        self.scale = max(1.0, dpi / 96.0)
+        try:
+            root.tk.call("tk", "scaling", dpi / 72.0)
+        except Exception:
+            pass
         wx, wy, ww, wh = _work_area()
         if not ww or not wh:
             wx, wy, ww, wh = 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
-        width = min(960, max(760, ww - 120))
+        width = min(int(980 * self.scale), max(int(760 * self.scale), ww - int(80 * self.scale)))
         # geometry 不含标题栏，额外预留约 40px，保证整窗落在工作区内
-        height = min(820, max(480, wh - 120))
+        height = min(int(860 * self.scale), max(int(520 * self.scale), wh - int(100 * self.scale)))
         x = wx + max(0, (ww - width) // 2)
         y = wy + max(0, (wh - height) // 2)
         root.geometry(f"{width}x{height}+{x}+{y}")
-        root.minsize(720, 480)
+        root.minsize(int(720 * self.scale), int(480 * self.scale))
 
         self._init_style()
         self._build_layout()
@@ -146,7 +206,7 @@ class App:
         style.configure("Plain.TFrame", background="#ffffff", borderwidth=0)
         style.configure("Headline.TLabel", font=FONT_HEADLINE, background="#ffffff")
         style.configure("Muted.TLabel", foreground="#5f6368", background="#ffffff")
-        style.configure("Treeview", rowheight=26, font=FONT_UI)
+        style.configure("Treeview", rowheight=int(26 * self.scale), font=FONT_UI)
         style.configure("Treeview.Heading", font=("Microsoft YaHei", 10, "bold"))
         style.configure("Accent.TButton", font=("Microsoft YaHei", 10, "bold"))
 
@@ -157,8 +217,12 @@ class App:
         self.refresh_btn = ttk.Button(bar, text="重新检测", style="Accent.TButton", command=self.refresh)
         self.refresh_btn.pack(side="left")
         ttk.Button(bar, text="复制报告", command=self.copy_report).pack(side="left", padx=8)
+        ttk.Button(bar, text="保存报告", command=self.save_report).pack(side="left")
+        ttk.Button(bar, text="关于", command=self.show_about).pack(side="left", padx=8)
         self.status_var = tk.StringVar(value="")
         ttk.Label(bar, textvariable=self.status_var, foreground="#5f6368").pack(side="right")
+        self.progress = ttk.Progressbar(bar, mode="indeterminate", length=int(110 * self.scale))
+        self.progress.pack(side="right", padx=(8, 12))
 
         # 用 Canvas 承载内容，窗口较小时可以滚动查看完整信息
         container = ttk.Frame(self.root)
@@ -173,7 +237,16 @@ class App:
         outer = ttk.Frame(canvas, padding=16)
         window_id = canvas.create_window((0, 0), window=outer, anchor="nw")
         outer.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window_id, width=e.width))
+        self._wrap_labels: list[ttk.Label] = []
+
+        def on_canvas_resize(event: tk.Event) -> None:
+            canvas.itemconfigure(window_id, width=event.width)
+            # 文本按窗口宽度换行，避免固定 wraplength 在缩放后出现截断
+            wrap = max(int(360 * self.scale), event.width - int(120 * self.scale))
+            for label in self._wrap_labels:
+                label.configure(wraplength=wrap)
+
+        canvas.bind("<Configure>", on_canvas_resize)
 
         def on_wheel(event: tk.Event) -> None:
             if isinstance(event.widget, tk.Text):
@@ -224,9 +297,9 @@ class App:
             ttk.Label(sys_box, text=label, width=9).grid(row=row, column=0, sticky="w", pady=2)
             var = tk.StringVar(value="—")
             self.sys_vars[key] = var
-            ttk.Label(sys_box, textvariable=var, wraplength=760, justify="left").grid(
-                row=row, column=1, sticky="w", pady=2
-            )
+            value_label = ttk.Label(sys_box, textvariable=var, wraplength=760, justify="left")
+            value_label.grid(row=row, column=1, sticky="w", pady=2)
+            self._wrap_labels.append(value_label)
         sys_box.columnconfigure(1, weight=1)
 
         # 硬件信息
@@ -239,9 +312,9 @@ class App:
             ttk.Label(hw_box, text=label, width=8).grid(row=row, column=0, sticky="nw", pady=2)
             var = tk.StringVar(value="—")
             self.hw_vars[key] = var
-            ttk.Label(hw_box, textvariable=var, wraplength=760, justify="left").grid(
-                row=row, column=1, sticky="w", pady=2
-            )
+            value_label = ttk.Label(hw_box, textvariable=var, wraplength=760, justify="left")
+            value_label.grid(row=row, column=1, sticky="w", pady=2)
+            self._wrap_labels.append(value_label)
         hw_box.columnconfigure(1, weight=1)
 
         # 等级对照表
@@ -266,6 +339,18 @@ class App:
         self.tree.tag_configure("tight", foreground="#e65100")
         self.tree.tag_configure("no", foreground="#9e9e9e")
         self.tree.pack(fill="x")
+        # 列宽按比例随窗口宽度调整，避免窄窗口下文字被截断
+        self._col_weights = {
+            "tier": 0.09,
+            "params": 0.10,
+            "need": 0.10,
+            "verdict": 0.07,
+            "reason": 0.21,
+            "speed": 0.16,
+            "scene": 0.27,
+        }
+        self._tree_width = 0
+        self.tree.bind("<Configure>", self._fit_tree_columns)
 
         # 能力说明
         advice_box = ttk.LabelFrame(outer, text=" 这台电脑用 AI 能做什么 ", padding=8)
@@ -275,11 +360,21 @@ class App:
         self.advice_text.configure(state="disabled")
 
     # ---------- 检测流程 ----------
+    def _fit_tree_columns(self, event: tk.Event) -> None:
+        width = event.width - int(6 * self.scale)
+        if width <= 0 or abs(width - self._tree_width) < 6:
+            return
+        self._tree_width = width
+        minimum = int(48 * self.scale)
+        for key, ratio in self._col_weights.items():
+            self.tree.column(key, width=max(minimum, int(width * ratio)))
+
     def refresh(self) -> None:
         if self.busy:
             return
         self.busy = True
         self.refresh_btn.configure(state="disabled")
+        self.progress.start(14)
         self.status_var.set("正在检测硬件…")
         self.headline_var.set("正在检测…")
         threading.Thread(target=self._detect_worker, daemon=True).start()
@@ -302,6 +397,7 @@ class App:
     ) -> None:
         self.busy = False
         self.refresh_btn.configure(state="normal")
+        self.progress.stop()
         if error or hw is None or ev is None:
             self.headline_var.set("检测失败")
             self.status_var.set(f"错误：{error}")
@@ -333,16 +429,22 @@ class App:
             f"{hw.ram_percent}%（可用 {hw.ram_available_gb:g} GB / 共 {hw.ram_total_gb:g} GB）"
         )
 
-        self.hw_vars["cpu"].set(
+        cpu_text = (
             f"{hw.cpu_name}\n{hw.cpu_cores} 核 {hw.cpu_threads} 线程 @ {hw.cpu_freq_mhz} MHz"
         )
-        gpu_text = "\n".join(f"{g.name}（{g.detail}）" for g in hw.gpus) or "未检测到显卡"
+        if hw.cpu_usage >= 0:
+            cpu_text += f"，当前占用 {hw.cpu_usage}%"
+        self.hw_vars["cpu"].set(cpu_text)
+        gpu_text = "\n".join(_gpu_line(g) for g in hw.gpus) or "未检测到显卡"
         self.hw_vars["gpu"].set(gpu_text)
         ram_text = f"{hw.ram_total_gb:g} GB（可用 {hw.ram_available_gb:g} GB"
         if hw.ram_speed_mhz:
             ram_text += f"，{hw.ram_speed_mhz} MHz"
         self.hw_vars["ram"].set(ram_text + "）")
-        self.hw_vars["disk"].set(f"{hw.disk_free_gb:g} GB 可用 / 共 {hw.disk_total_gb:g} GB")
+        disk_text = f"{hw.disk_free_gb:g} GB 可用 / 共 {hw.disk_total_gb:g} GB"
+        if hw.disk_model:
+            disk_text = f"{hw.disk_model}，{disk_text}"
+        self.hw_vars["disk"].set(disk_text)
 
         self.tree.delete(*self.tree.get_children())
         for t in ev.tiers:
@@ -378,12 +480,45 @@ class App:
         self.root.clipboard_append(self.report)
         self.status_var.set("报告已复制到剪贴板")
 
+    def save_report(self) -> None:
+        if not self.report:
+            return
+        default = f"AI部署检测_{datetime.now():%Y%m%d_%H%M}.txt"
+        path = filedialog.asksaveasfilename(
+            title="保存检测报告",
+            defaultextension=".txt",
+            initialfile=default,
+            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            # utf-8-sig 让记事本等工具正确识别中文
+            with open(path, "w", encoding="utf-8-sig") as fh:
+                fh.write(self.report)
+        except OSError as exc:
+            self.status_var.set(f"保存失败：{exc}")
+            return
+        self.status_var.set(f"报告已保存：{os.path.basename(path)}")
+
+    def show_about(self) -> None:
+        messagebox.showinfo(
+            "关于",
+            f"{APP_TITLE}  v{VERSION}\n\n"
+            "检测本机 CPU、内存、显卡与磁盘，评估可在本地运行的 AI 模型等级。\n"
+            "全部检测在本机完成，不联网、不上传任何数据。\n\n"
+            f"运行环境：Python {platform.python_version()} / "
+            f"Tk {self.root.tk.call('info', 'patchlevel')}",
+            parent=self.root,
+        )
+
 
 def run_selftest(output: str = "") -> int:
     """可移植性自检：逐项验证运行环境，结果写入 JSON 文件。
 
     返回 0 表示全部关键项通过，1 表示有失败项，2 表示结果文件写不出去。
     """
+    _enable_dpi_awareness()
     checks: list[dict[str, object]] = []
 
     def check(name: str, func, optional: bool = False) -> None:
@@ -439,12 +574,26 @@ def run_selftest(output: str = "") -> int:
         available = bool(candidates & families)
         return available, "微软雅黑可用" if available else "微软雅黑缺失，中文会回退到默认字体"
 
+    def icon_probe() -> tuple[bool, str]:
+        path = _asset("icon.ico")
+        return os.path.isfile(path), f"{path}（{os.path.getsize(path) // 1024} KB）"
+
+    def dpi_probe() -> tuple[bool, str]:
+        if sys.platform != "win32":
+            return True, "非 Windows，跳过"
+        import ctypes
+
+        dpi = int(ctypes.windll.user32.GetDpiForSystem())
+        return True, f"{dpi} dpi（{'已感知' if dpi >= 108 else '未感知，界面会被拉伸'}）"
+
     check("单文件运行环境", frozen_probe)
     check("临时目录可写", temp_probe)
     check("Tk 图形栈", tk_probe)
     check("硬件采集", hw_probe)
     check("等级评估", eval_probe)
     check("报告生成", report_probe)
+    check("图标资源", icon_probe)
+    check("DPI 感知", dpi_probe)
     check("中文字体", font_probe, optional=True)
 
     passed = all(c["ok"] for c in checks if not c["optional"])
@@ -480,6 +629,7 @@ def main() -> int:
         return run_selftest(target)
     if "--cli" in args:
         return run_cli()
+    _enable_dpi_awareness()
     root = tk.Tk()
     App(root)
     root.mainloop()

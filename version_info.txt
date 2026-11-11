@@ -1,0 +1,33 @@
+# UTF-8
+# PyInstaller 使用的 Windows 版本资源，让 exe 属性里能看到版本号
+VSVersionInfo(
+    ffi=FixedFileInfo(
+        filevers=(1, 1, 0, 0),
+        prodvers=(1, 1, 0, 0),
+        mask=0x3F,
+        flags=0x0,
+        OS=0x40004,
+        fileType=0x1,
+        subtype=0x0,
+        date=(0, 0),
+    ),
+    kids=[
+        StringFileInfo(
+            [
+                StringTable(
+                    "080404B0",
+                    [
+                        StringStruct("CompanyName", "CS Tools"),
+                        StringStruct("FileDescription", "本地 AI 部署能力检测"),
+                        StringStruct("FileVersion", "1.1.0.0"),
+                        StringStruct("InternalName", "cs_ai_check"),
+                        StringStruct("OriginalFilename", "cs_ai_check.exe"),
+                        StringStruct("ProductName", "本地 AI 部署能力检测"),
+                        StringStruct("ProductVersion", "1.1.0.0"),
+                    ],
+                )
+            ]
+        ),
+        VarFileInfo([VarStruct("Translation", [2052, 1200])]),
+    ],
+)

@@ -17,6 +17,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from ctypes import wintypes
 from dataclasses import dataclass, field
 
@@ -43,6 +44,7 @@ class GpuInfo:
     vram_gb: float  # 显存容量（GB），0 表示未知或共享
     kind: str  # nvidia / discrete / integrated
     detail: str = ""
+    driver: str = ""
 
 
 @dataclass
@@ -65,6 +67,8 @@ class HardwareInfo:
     username: str = ""
     arch: str = ""
     ram_percent: int = 0
+    cpu_usage: int = -1  # 当前 CPU 占用率（%），-1 表示未采样
+    disk_model: str = ""
 
     @property
     def dgpu(self) -> GpuInfo | None:
@@ -99,6 +103,39 @@ def _read_memory() -> tuple[float, float, int]:
         return 0.0, 0.0, 0
     gb = 1024 ** 3
     return status.ullTotalPhys / gb, status.ullAvailPhys / gb, int(status.dwMemoryLoad)
+
+
+def _read_cpu_usage(sample_seconds: float = 0.3) -> int:
+    """两次采样 GetSystemTimes，算出当前 CPU 占用率（%）。"""
+    if sys.platform != "win32":
+        return -1
+
+    class _FileTime(ctypes.Structure):
+        _fields_ = [("low", wintypes.DWORD), ("high", wintypes.DWORD)]
+
+    def snapshot() -> tuple[int, int, int] | None:
+        idle, kernel, user = _FileTime(), _FileTime(), _FileTime()
+        ok = ctypes.windll.kernel32.GetSystemTimes(
+            ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+        )
+        if not ok:
+            return None
+        to_int = lambda ft: (ft.high << 32) + ft.low  # noqa: E731
+        return to_int(idle), to_int(kernel), to_int(user)
+
+    try:
+        first = snapshot()
+        time.sleep(sample_seconds)
+        second = snapshot()
+        if not first or not second:
+            return -1
+        idle = second[0] - first[0]
+        total = (second[1] - first[1]) + (second[2] - first[2])
+        if total <= 0:
+            return -1
+        return max(0, min(100, round(100 * (1 - idle / total))))
+    except Exception:
+        return -1
 
 
 def _localize_product(product: str) -> str:
@@ -189,8 +226,9 @@ $result = [ordered]@{
         freq = $cpu.MaxClockSpeed
     }
     gpus = @($gpus | ForEach-Object {
-        @{ name = $_.Name; vram = [double]$_.AdapterRAM }
+        @{ name = $_.Name; vram = [double]$_.AdapterRAM; driver = $_.DriverVersion }
     })
+    disk = (Get-CimInstance Win32_DiskDrive | Select-Object -First 1).Model
     ram = @{
         total = [double]$cs.TotalPhysicalMemory
         modules = @($mem | ForEach-Object { @{ capacity = [double]$_.Capacity; speed = $_.Speed } })
@@ -373,6 +411,9 @@ def detect_hardware() -> HardwareInfo:
         if not info.ram_total_gb and ram.get("total"):
             info.ram_total_gb = round(float(ram["total"]) / 1024 ** 3, 1)
 
+        if cim.get("disk"):
+            info.disk_model = " ".join(str(cim["disk"]).split())
+
         gpus = cim.get("gpus") or []
         if not isinstance(gpus, list):
             gpus = [gpus]
@@ -390,7 +431,15 @@ def detect_hardware() -> HardwareInfo:
                 detail = "显存未知（系统接口读数受限）"
             else:
                 detail = f"显存 {vram_gb:g} GB"
-            info.gpus.append(GpuInfo(name=name, vram_gb=vram_gb, kind=kind, detail=detail))
+            info.gpus.append(
+                GpuInfo(
+                    name=name,
+                    vram_gb=vram_gb,
+                    kind=kind,
+                    detail=detail,
+                    driver=str(item.get("driver") or "").strip(),
+                )
+            )
 
     # nvidia-smi 的数据更准确，用它覆盖同型号的估算值
     nvidia = _read_nvidia()
@@ -406,6 +455,7 @@ def detect_hardware() -> HardwareInfo:
         info.cpu_threads = os.cpu_count() or 0
 
     info.disk_total_gb, info.disk_free_gb = (round(v, 1) for v in _read_disk())
+    info.cpu_usage = _read_cpu_usage()
     if not info.os_name:
         info.os_name = f"{sys.platform}"
     return info
