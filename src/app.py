@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 import platform
 import sys
@@ -22,7 +23,7 @@ import customtkinter as ctk
 from appinfo import APP_TITLE, VERSION
 from evaluator import TIERS, Evaluation, evaluate
 from hardware import HardwareInfo, detect_hardware
-from platform_win import asset_path, work_area
+from platform_win import asset_path, grab_window_rgb, system_dpi, work_area, write_png
 from report import build_report, gpu_line, run_cli
 from selftest import run_selftest
 
@@ -49,12 +50,66 @@ STATUS_TEXTS = (
 )
 
 
+class _SelectableText(tk.Text):
+    """只读文本块：支持鼠标拖选与 Ctrl+C 复制，高度随换行自动伸缩。"""
+
+    def __init__(self, master, font, fg: str = TEXT, bg: str = CARD) -> None:
+        super().__init__(
+            master,
+            height=1,
+            width=1,
+            wrap="word",
+            bd=0,
+            highlightthickness=0,
+            bg=bg,
+            fg=fg,
+            font=font,
+            cursor="xterm",
+            padx=0,
+            pady=0,
+            insertwidth=0,
+            selectbackground="#bfdbfe",
+            selectforeground=TEXT,
+            takefocus=0,
+        )
+        self.configure(state="disabled")
+        self.bind("<Configure>", self._autosize)
+
+    def set_text(self, text: str, color: str | None = None) -> None:
+        # 内容未变时只更新颜色，避免打断用户正在进行的拖选
+        if self.get("1.0", "end-1c") != text:
+            self.configure(state="normal")
+            self.delete("1.0", "end")
+            self.insert("1.0", text)
+            self.configure(state="disabled")
+            self._autosize()
+        if color:
+            self.configure(fg=color)
+
+    def _autosize(self, event: tk.Event | None = None) -> None:
+        width = (event.width if event is not None else self.winfo_width()) - 4
+        if width <= 20:
+            return
+        font = self.cget("font")
+        lines = 0
+        for line in self.get("1.0", "end-1c").split("\n"):
+            if not line:
+                lines += 1
+                continue
+            pixels = self.tk.call("font", "measure", font, line)
+            lines += max(1, math.ceil(pixels / width))
+        lines = max(1, lines)
+        if int(self.cget("height")) != lines:
+            self.configure(height=lines)
+
+
 class App:
     """图形界面主窗口。"""
 
     def __init__(self, root: ctk.CTk) -> None:
         self.root = root
         self.report = ""
+        self.hw: HardwareInfo | None = None
         self.busy = False
         self._score_after: str | None = None
         self._status_after: str | None = None
@@ -193,15 +248,8 @@ class App:
             scrollbar_button_hover_color="#94a3b8",
         )
         body.pack(fill="both", expand=True)
-        self._wrap_labels: list[ctk.CTkLabel] = []
-        body.bind("<Configure>", self._on_body_resize)
+        self.body = body
         return body
-
-    def _on_body_resize(self, event: tk.Event) -> None:
-        # CTkLabel 的 wraplength 内部会再乘缩放，这里换算回逻辑像素
-        wrap = max(360, int(event.width / self.scale) - 108)
-        for label in self._wrap_labels:
-            label.configure(wraplength=wrap)
 
     def _card(self, body: ctk.CTkFrame, pady: tuple[int, int] = (0, 14)) -> ctk.CTkFrame:
         card = ctk.CTkFrame(body, fg_color=CARD, corner_radius=14, border_width=1, border_color=BORDER)
@@ -226,11 +274,9 @@ class App:
         inner = ctk.CTkFrame(card, fg_color="transparent")
         inner.pack(fill="x", padx=20, pady=18)
 
-        self.headline_label = ctk.CTkLabel(
-            inner, text="正在检测…", font=self._font(20, "bold"), text_color=MUTED, anchor="w", justify="left"
-        )
-        self.headline_label.pack(fill="x")
-        self._wrap_labels.append(self.headline_label)
+        self.headline = _SelectableText(inner, font=self._font(20, "bold"), fg=MUTED)
+        self.headline.pack(fill="x")
+        self.headline.set_text("正在检测…")
 
         meta = ctk.CTkFrame(inner, fg_color="transparent")
         meta.pack(fill="x", pady=(10, 0))
@@ -284,33 +330,25 @@ class App:
 
     def _fill_info_card(
         self, card: ctk.CTkFrame, title: str, rows: list[tuple[str, str]]
-    ) -> dict[str, ctk.CTkLabel]:
+    ) -> dict[str, _SelectableText]:
         inner = ctk.CTkFrame(card, fg_color="transparent")
         inner.pack(fill="both", expand=True, padx=18, pady=(14, 14))
         ctk.CTkLabel(
             inner, text=title, font=self._font(14, "bold"), text_color="#334155", anchor="w"
         ).pack(fill="x", pady=(0, 8))
 
-        values: dict[str, ctk.CTkLabel] = {}
+        values: dict[str, _SelectableText] = {}
         for key, label in rows:
             row = ctk.CTkFrame(inner, fg_color="transparent")
             row.pack(fill="x", pady=2)
             ctk.CTkLabel(
                 row, text=label, width=76, font=self._font(12), text_color=MUTED, anchor="w"
             ).pack(side="left", anchor="n")
-            value = ctk.CTkLabel(
-                row, text="—", font=self._font(12), text_color=TEXT, anchor="w", justify="left"
-            )
+            value = _SelectableText(row, font=self._font(12), fg=TEXT)
             value.pack(side="left", fill="x", expand=True)
+            value.set_text("—")
             values[key] = value
 
-        # 半宽卡片需要按自身宽度换行，不能沿用整窗 wraplength
-        def resize(event: tk.Event) -> None:
-            wrap = max(160, int(event.width / self.scale) - 64)
-            for label in values.values():
-                label.configure(wraplength=wrap)
-
-        card.bind("<Configure>", resize)
         return values
 
     def _build_tier_table(self, body: ctk.CTkFrame) -> None:
@@ -352,6 +390,7 @@ class App:
         self.tree.tag_configure("skel_even", foreground=SKELETON, background=CARD)
         self.tree.tag_configure("skel_hot", foreground=SKELETON_HOT, background="#e8f0fe")
         self.tree.pack(fill="x")
+        self.tree.bind("<Control-c>", self.copy_tree_selection)
         self._fill_skeleton()
 
         self._col_weights = {
@@ -437,10 +476,11 @@ class App:
         error: Exception | None,
     ) -> None:
         self.busy = False
+        self.hw = hw
         self._stop_loading()
         self.refresh_btn.configure(state="normal", fg_color=PRIMARY, hover_color=PRIMARY_HOVER)
         if error or hw is None or ev is None:
-            self.headline_label.configure(text="检测失败", text_color=BAD)
+            self.headline.set_text("检测失败", BAD)
             self.status_var.set(f"错误：{error}")
             for chip, label in self.tag_chips:
                 chip.configure(fg_color="#f3f4f6")
@@ -464,7 +504,7 @@ class App:
         else:
             # 能跑但都只是「勉强」级别，用橙色提醒
             color = WARN
-        self.headline_label.configure(text=ev.headline, text_color=color)
+        self.headline.set_text(ev.headline, color)
 
         self.tier_label.configure(text=f"等级：{ev.tier}")
         self.path_label.configure(text=f"推理路径：{ev.path}")
@@ -484,31 +524,31 @@ class App:
             label.configure(text=f"{name} {mark}", text_color=foreground)
 
     def _render_system(self, hw: HardwareInfo) -> None:
-        self.sys_labels["os"].configure(text=hw.os_name)
-        self.sys_labels["arch"].configure(text=hw.arch)
-        self.sys_labels["host"].configure(text=hw.hostname)
-        self.sys_labels["user"].configure(text=hw.username)
-        self.sys_labels["mem"].configure(
-            text=f"{hw.ram_percent}%（可用 {hw.ram_available_gb:g} GB / 共 {hw.ram_total_gb:g} GB）"
+        self.sys_labels["os"].set_text(hw.os_name)
+        self.sys_labels["arch"].set_text(hw.arch)
+        self.sys_labels["host"].set_text(hw.hostname)
+        self.sys_labels["user"].set_text(hw.username)
+        self.sys_labels["mem"].set_text(
+            f"{hw.ram_percent}%（可用 {hw.ram_available_gb:g} GB / 共 {hw.ram_total_gb:g} GB）"
         )
 
     def _render_hardware(self, hw: HardwareInfo) -> None:
         cpu_text = f"{hw.cpu_name}\n{hw.cpu_cores} 核 {hw.cpu_threads} 线程 @ {hw.cpu_freq_mhz} MHz"
         if hw.cpu_usage >= 0:
             cpu_text += f"，当前占用 {hw.cpu_usage}%"
-        self.hw_labels["cpu"].configure(text=cpu_text)
+        self.hw_labels["cpu"].set_text(cpu_text)
 
-        self.hw_labels["gpu"].configure(text="\n".join(gpu_line(g) for g in hw.gpus) or "未检测到显卡")
+        self.hw_labels["gpu"].set_text("\n".join(gpu_line(g) for g in hw.gpus) or "未检测到显卡")
 
         ram_text = f"{hw.ram_total_gb:g} GB（可用 {hw.ram_available_gb:g} GB"
         if hw.ram_speed_mhz:
             ram_text += f"，{hw.ram_speed_mhz} MHz"
-        self.hw_labels["ram"].configure(text=ram_text + "）")
+        self.hw_labels["ram"].set_text(ram_text + "）")
 
         disk_text = f"{hw.disk_free_gb:g} GB 可用 / 共 {hw.disk_total_gb:g} GB"
         if hw.disk_model:
             disk_text = f"{hw.disk_model}，{disk_text}"
-        self.hw_labels["disk"].configure(text=disk_text)
+        self.hw_labels["disk"].set_text(disk_text)
 
     def _render_tiers(self, ev: Evaluation) -> None:
         self.tree.delete(*self.tree.get_children())
@@ -559,7 +599,7 @@ class App:
             if not self.busy:
                 return
             color = PRIMARY if self._spinner_index % 2 == 0 else "#93b4f8"
-            self.headline_label.configure(text="●  正在检测硬件…", text_color=color)
+            self.headline.set_text("●  正在检测硬件…", color)
             self._spinner_index += 1
             self._spinner_after = self.root.after(450, tick)
 
@@ -647,6 +687,17 @@ class App:
         tick()
 
     # ---------- 操作 ----------
+    def copy_tree_selection(self, _event: tk.Event | None = None) -> None:
+        """复制等级表中选中的行（制表符分隔，便于粘进表格软件）。"""
+        rows = self.tree.selection()
+        if not rows:
+            self.status_var.set("请先点击选中表格行，再按 Ctrl+C 复制")
+            return
+        text = "\n".join("\t".join(self.tree.item(row, "values")) for row in rows)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.status_var.set(f"已复制表格 {len(rows)} 行")
+
     def copy_report(self) -> None:
         if not self.report:
             return
@@ -659,12 +710,19 @@ class App:
             return
         default = f"AI部署检测_{datetime.now():%Y%m%d_%H%M}.txt"
         path = filedialog.asksaveasfilename(
-            title="保存检测报告",
+            title="保存检测报告（文本选 .txt，图片选 .png）",
             defaultextension=".txt",
             initialfile=default,
-            filetypes=[("文本文件", "*.txt"), ("所有文件", "*.*")],
+            filetypes=[("文本文件", "*.txt"), ("PNG 图片", "*.png")],
         )
         if not path:
+            return
+        suffix = os.path.splitext(path)[1].lower()
+        if suffix == ".png":
+            self._save_report_image(path)
+            return
+        if suffix not in ("", ".txt"):
+            self.status_var.set("只支持保存为 .txt 或 .png")
             return
         try:
             # utf-8-sig 让记事本等工具正确识别中文
@@ -675,15 +733,130 @@ class App:
             return
         self.status_var.set(f"报告已保存：{os.path.basename(path)}")
 
+    def _save_report_image(self, path: str) -> None:
+        """把整份报告拼成一张长图：逐屏滚动截图，再按滚动偏移拼接。"""
+        canvas = self.body._parent_canvas
+        box = canvas.bbox("all")
+        if not box:
+            self.status_var.set("保存图片失败：报告区域尚未渲染")
+            return
+
+        total = int(box[3])  # 内容包括的总高度（物理像素）
+        view = canvas.winfo_height()
+        left = canvas.winfo_rootx()
+        top = canvas.winfo_rooty()
+        width = canvas.winfo_width()
+        if view <= 0 or width <= 0:
+            self.status_var.set("保存图片失败：窗口尺寸异常")
+            return
+
+        self.status_var.set("正在生成报告图片…")
+        self.root.update_idletasks()
+        saved_scroll = canvas.yview()[0]
+        saved_geometry = self.root.wm_geometry()
+        moved = False
+        rows: list[bytes | None] = [None] * total
+        try:
+            # 窗口有一部分在屏幕外时截不到内容，先把窗口挪进工作区
+            if self._ensure_capture_visible(left, top, width, view):
+                moved = True
+                self.root.update_idletasks()
+                self.root.update()
+                left = canvas.winfo_rootx()
+                top = canvas.winfo_rooty()
+
+            pos = 0
+            while pos < total:
+                canvas.yview_moveto(pos / total)
+                # 等 canvas 滚动与重绘完成，否则会截到上一屏的内容
+                self.root.update_idletasks()
+                self.root.update()
+                time.sleep(0.12)
+                self.root.update()
+
+                rgb, win_w, win_h, win_left, win_top = grab_window_rgb(int(self.root.winfo_id()))
+                stride = win_w * 3
+                crop_x = left - win_left
+                crop_y = top - win_top
+                # canvasy(0) 是视口顶端对应的内容行号，取整可能差 1 px，用实测值定位
+                start = int(round(canvas.canvasy(0)))
+                for row in range(view):
+                    dest = start + row
+                    src_y = crop_y + row
+                    if 0 <= dest < total and 0 <= src_y < win_h:
+                        begin = src_y * stride + crop_x * 3
+                        rows[dest] = rgb[begin : begin + width * 3]
+                pos += view
+        except OSError as exc:
+            self.status_var.set(f"保存图片失败：{exc}")
+            return
+        finally:
+            canvas.yview_moveto(saved_scroll)
+            if moved:
+                self.root.wm_geometry(saved_geometry)
+
+        blank = bytes(width * 3)
+        write_png(path, width, total, b"".join(row if row is not None else blank for row in rows))
+        self.status_var.set(f"报告图片已保存：{os.path.basename(path)}（{width}×{total}）")
+
+    def _ensure_capture_visible(self, left: int, top: int, width: int, height: int) -> bool:
+        """待截区域超出工作区时把窗口平移回来，返回是否移动过。
+
+        参数是待截区域的屏幕坐标（物理像素）；截图取的是屏幕上可见内容，
+        区域在屏幕外会变成黑块，所以先移动窗口再截，截完由调用方复原。
+        """
+        wx, wy, ww, wh = work_area()
+        if not ww or not wh:
+            return False
+
+        dx = dy = 0
+        if left + width > wx + ww:
+            dx = wx + ww - (left + width)
+        if left + dx < wx:
+            dx = wx - left
+        if top + height > wy + wh:
+            dy = wy + wh - (top + height)
+        if top + dy < wy:
+            dy = wy - top
+        if dx == 0 and dy == 0:
+            return False
+
+        self.root.wm_geometry(
+            f"{self.root.winfo_width()}x{self.root.winfo_height()}"
+            f"+{self.root.winfo_x() + dx}+{self.root.winfo_y() + dy}"
+        )
+        return True
+
     def show_about(self) -> None:
+        if self.hw is not None:
+            # 去掉「（内部版本 …）」，避免对话框里折行
+            os_name = self.hw.os_name.split("（")[0]
+            arch = self.hw.arch
+        else:
+            machine = platform.machine()
+            os_name = f"{platform.system()} {platform.release()}"
+            arch = "64 位 (x64)" if machine.lower() in ("amd64", "x86_64") else machine
+        runtime = "单文件 exe" if getattr(sys, "frozen", False) else "源码运行"
         messagebox.showinfo(
             "关于",
             f"{APP_TITLE}  v{VERSION}\n\n"
-            "检测本机 CPU、内存、显卡与磁盘，评估可在本地运行的 AI 模型等级。\n"
-            "全部检测在本机完成，不联网、不上传任何数据。\n\n"
-            f"运行环境：Python {platform.python_version()} / "
-            f"Tk {self.root.tk.call('info', 'patchlevel')} / "
-            f"customtkinter {ctk.__version__}",
+            "检测本机硬件，评估可在本地运行的开源大模型等级。\n"
+            "不推荐具体模型，只说明这台电脑用 AI 能做到什么程度。\n\n"
+            "检测内容\n"
+            "  CPU 型号 / 核心 / 主频 / 当前占用\n"
+            "  内存容量 / 频率 / 可用空间\n"
+            "  显卡型号 / 显存 / 驱动版本\n"
+            "  磁盘型号 / 可用空间\n"
+            "  操作系统版本与架构\n\n"
+            "评估方式\n"
+            "  模型占用 ≈ 参数量 × 0.58 GB/B × 框架开销\n"
+            "  按显存或内存余量判定：推荐 / 可用 / 紧张 / 不支持\n"
+            "  分六档：入门级 ≤1.5B 至旗舰级 70B+，附速度与用途标签\n\n"
+            "隐私说明\n"
+            "  全部检测在本机完成，不联网、不上传任何数据。\n\n"
+            "运行环境\n"
+            f"  {os_name}\n"
+            f"  {arch} · {system_dpi(self.root)} dpi · {runtime}",
             parent=self.root,
         )
 

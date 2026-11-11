@@ -3,7 +3,8 @@
 估算方法参考 llm-checker / llmscan：
 - 4-bit 量化下每个参数约占 0.58 字节，再乘推理框架开销得到实际占用；
 - 独显按显存的 80% 作为可用预算，纯 CPU 按物理内存的 55%；
-- 软预算内为「推荐」，硬预算内为「勉强」，超出为「不支持」。
+- 软预算内为「推荐」，硬预算内为「勉强」，超出为「不支持」；
+- 生成速度按「可用带宽 × 带宽利用率 ÷ 权重体积」估算，拿不到带宽时退回固定档位。
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from hardware import HardwareInfo
+from hardware import GpuInfo, HardwareInfo
 
 # 4-bit（Q4_K_M）量化下每个参数占用的 GB 数，取实测校准值
 GB_PER_PARAM_Q4 = 0.58
@@ -108,9 +109,36 @@ POSITION = {
     "旗舰级": "本地体验接近云端小模型",
 }
 
-# 预估生成速度（token/s），按代表参数量分档
+# 预估生成速度（token/s），按代表参数量分档；仅在拿不到带宽时兜底
 CPU_SPEED = {1.5: "15-28", 3.0: "8-15", 8.0: "3-5", 14.0: "1.5-3", 32.0: "<1", 70.0: "不可用"}
 GPU_SPEED = {1.5: "80-130", 3.0: "50-90", 8.0: "25-40", 14.0: "14-24", 32.0: "7-12", 70.0: "3-6"}
+
+# 解码阶段的带宽利用率（MBU）：实测大约能跑满理论带宽的 50%–80%
+CPU_MBU = 0.6
+GPU_MBU = 0.7
+
+# 常见独显的显存带宽（GB/s）。按关键字匹配，长型号写在前面，避免被短型号抢先命中
+GPU_BANDWIDTH: tuple[tuple[str, float], ...] = (
+    ("5090", 1792), ("5080", 960), ("5070 ti", 896), ("5070", 672),
+    ("5060 ti", 448), ("5060", 448),
+    ("4090", 1008), ("4080 super", 736), ("4080", 717),
+    ("4070 ti super", 672), ("4070 ti", 504), ("4070 super", 504), ("4070", 504),
+    ("4060 ti", 288), ("4060", 272),
+    ("3090 ti", 1008), ("3090", 936), ("3080 ti", 912), ("3080", 760),
+    ("3070 ti", 608), ("3070", 448), ("3060 ti", 448), ("3060", 360), ("3050", 224),
+    ("2080 ti", 616), ("2080", 448), ("2070", 448), ("2060", 336),
+    ("1660 ti", 288), ("1660", 192), ("1650", 192),
+    ("1080 ti", 484), ("1080", 320), ("1070", 256), ("1060", 192),
+    ("7900 xtx", 960), ("7900 xt", 800), ("7800 xt", 624), ("7700 xt", 432),
+    ("7600", 288), ("6900 xt", 512), ("6800 xt", 512), ("6800", 512),
+    ("6700 xt", 384), ("6600 xt", 224), ("6600", 224),
+    ("a770", 560), ("a750", 512), ("b580", 456),
+)
+
+# 型号不在表内时按显存档位粗估带宽（GB/s）
+VRAM_BANDWIDTH: tuple[tuple[float, float], ...] = (
+    (4, 160), (6, 220), (8, 272), (12, 400), (16, 560), (24, 800), (999, 1000)
+)
 
 
 @dataclass
@@ -183,6 +211,46 @@ def _speed_level(speed: str, is_gpu: bool) -> str:
     return "很快"
 
 
+def _ram_bandwidth(hw: HardwareInfo) -> float:
+    """按内存频率与条数估算理论带宽（GB/s），频率未知时返回 0。"""
+    if hw.ram_speed_mhz <= 0:
+        return 0.0
+    # 单条按单通道算，两条及以上按双通道算
+    channels = 1 if hw.ram_modules == 1 else 2
+    return hw.ram_speed_mhz * 8 * channels / 1000
+
+
+def _gpu_bandwidth(gpu: GpuInfo | None) -> float:
+    """查表得到显存带宽（GB/s），型号不认识的按显存档位粗估。"""
+    name = (gpu.name or "").lower() if gpu else ""
+    for keyword, bandwidth in GPU_BANDWIDTH:
+        if keyword in name:
+            return bandwidth
+    vram = gpu.vram_gb if gpu else 0.0
+    for limit, bandwidth in VRAM_BANDWIDTH:
+        if vram <= limit:
+            return bandwidth
+    return 0.0
+
+
+def _estimate_speed(params_b: float, bandwidth: float, is_gpu: bool, fallback: str) -> str:
+    """按「带宽 × 利用率 ÷ 权重体积」估算解码速度，区间取 -30% / +15%。
+
+    这个模型假设解码阶段是纯访存瓶颈，权重每生成一个 token 要完整读一遍；
+    带宽拿不到时退回固定档位，避免给出没有依据的数字。
+    """
+    if bandwidth <= 0:
+        return fallback
+    weight_gb = params_b * GB_PER_PARAM_Q4
+    mid = bandwidth * (GPU_MBU if is_gpu else CPU_MBU) / weight_gb
+    low, high = max(mid * 0.7, 1.0), mid * 1.15
+    if high <= 1:
+        return "<1"
+    if high < 10:
+        return f"{low:.1f}-{high:.1f}"
+    return f"{low:.0f}-{high:.0f}"
+
+
 def _usage_tags(tier: str | None) -> list[tuple[str, str]]:
     """按等级给出用途标签，✔ 可用、△ 勉强、✘ 不适合。"""
     matrix = {
@@ -203,6 +271,7 @@ def evaluate(hw: HardwareInfo) -> Evaluation:
     path, pool, pool_label, is_gpu, rec_line, ok_line = _budget(hw)
     overhead = GPU_OVERHEAD if is_gpu else CPU_OVERHEAD
     speed_table = GPU_SPEED if is_gpu else CPU_SPEED
+    bandwidth = _gpu_bandwidth(hw.dgpu) if is_gpu else _ram_bandwidth(hw)
 
     tiers: list[TierOption] = []
     for label, params_desc, params_b, scene in TIERS:
@@ -220,7 +289,12 @@ def evaluate(hw: HardwareInfo) -> Evaluation:
         else:
             verdict = "不支持"
             reason = f"占用 {ratio * 100:.0f}%，超出上限"
-        speed = speed_table.get(params_b, "未知")
+        # 放不下的模型不报速度，避免出现「不支持 / 7-12 token/s」这种自相矛盾的结论
+        speed = (
+            "不可用"
+            if verdict == "不支持"
+            else _estimate_speed(params_b, bandwidth, is_gpu, speed_table.get(params_b, "未知"))
+        )
         tiers.append(
             TierOption(
                 label=label,
