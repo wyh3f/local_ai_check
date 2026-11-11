@@ -1,0 +1,4 @@
+# 运行时依赖：无（仅使用 Python 标准库 tkinter / ctypes / subprocess）
+# 打包依赖：PyInstaller
+# 环境：conda env exe_ai_check (Python 3.11)
+pyinstaller>=6.10

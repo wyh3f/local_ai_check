@@ -1,0 +1,18 @@
+<Configuration>
+  <MappedFolders>
+    <MappedFolder>
+      <HostFolder>D:\Desktop\python_exe_cs\cs_exe_2_11_10\dist</HostFolder>
+      <SandboxFolder>C:\dist</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+    <MappedFolder>
+      <HostFolder>D:\Desktop\python_exe_cs\cs_exe_2_11_10\portability</HostFolder>
+      <SandboxFolder>C:\test</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <Networking>Disable</Networking>
+  <LogonCommand>
+    <Command>powershell.exe -ExecutionPolicy Bypass -WindowStyle Hidden -File C:\test\smoke_test.ps1</Command>
+  </LogonCommand>
+</Configuration>
